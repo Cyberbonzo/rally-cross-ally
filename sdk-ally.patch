@@ -1,0 +1,170 @@
+diff --git a/brick/brick.cmake b/brick/brick.cmake
+index 0df2b04..a1da7d2 100644
+--- a/brick/brick.cmake
++++ b/brick/brick.cmake
+@@ -1,7 +1,7 @@
+ # A recomp module's Brick build (aarch64): included by its CMakeLists.txt after psxrecomp_add_game_runtime.
+ # The Vulkan presenter shows the runtime's frames (host.cpp, patch 0007); no desktop OpenGL there
+ # (gl_absent.c). DEADSTATION_VULKAN_INCLUDE: the folder with the Vulkan headers (tools/build-module.sh).
+-if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
++if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|x86_64)$")
+     return()
+ endif()
+ if(NOT DEADSTATION_VULKAN_INCLUDE OR NOT EXISTS "${DEADSTATION_VULKAN_INCLUDE}/vulkan/vulkan.hpp")
+@@ -31,7 +31,7 @@ endforeach()
+ # PSXRecomp's lean CPU timing (patch 0011): whole-instruction cycles and an inline branch check, for the Brick's CPU;
+ # its GPU drawn by Deadstation's Vulkan (psx_gpu.cpp, patch 0012: PSXRecomp's own Vulkan backend left out)
+ target_compile_definitions(psx-runtime PRIVATE PSX_LEAN_TIMING=1 PSX_HOST_VK_RENDERER=1)
+-set(_ds_sources ${_ds_brick}/host.cpp ${_ds_brick}/host_link.cpp ${_ds_brick}/psx_gpu.cpp ${_ds_brick}/video.cpp ${_ds_brick}/panel.cpp)
++set(_ds_sources ${_ds_brick}/host.cpp ${_ds_brick}/host_link.cpp ${_ds_brick}/psx_gpu.cpp ${_ds_brick}/video.cpp ${CMAKE_SOURCE_DIR}/ally/panel.cpp)
+ target_sources(psx-runtime PRIVATE ${_ds_sources} ${_ds_brick}/gl_absent.c ${_ds_spirv})
+ set_source_files_properties(${_ds_sources} PROPERTIES
+         INCLUDE_DIRECTORIES "${_ds_brick};${DEADSTATION_VULKAN_INCLUDE};${CMAKE_CURRENT_BINARY_DIR}/deadstation_shaders;${_ds_brick}/../psxrecomp/runtime/include")
+diff --git a/brick/host.cpp b/brick/host.cpp
+index 882c490..d3c812a 100644
+--- a/brick/host.cpp
++++ b/brick/host.cpp
+@@ -172,8 +172,8 @@ void profileSample(int, siginfo_t *, void *context)
+ 	if (i < ProfileCap / 4)
+ 	{
+ 		const ucontext_t *uc = (const ucontext_t *)context;
+-		profile[4 * i] = uc->uc_mcontext.pc;
+-		profile[4 * i + 1] = uc->uc_mcontext.regs[30];
++		profile[4 * i] = uc->uc_mcontext.gregs[REG_RIP];
++		profile[4 * i + 1] = 0 /* x86 has no link register */;
+ 		profile[4 * i + 2] = (uint64_t)syscall(SYS_gettid);
+ 		profile[4 * i + 3] = g_psx_last_fn_entry;
+ 	}
+@@ -233,7 +233,7 @@ void onSegv(int sig, siginfo_t *info, void *context)
+ 		fclose(maps);
+ 	}
+ 	const int n = snprintf(line, sizeof(line), "Deadstation: recomp module crash: signal %d pc %llx lr %llx address %llx base %llx\n",
+-			sig, (unsigned long long)uc->uc_mcontext.pc, (unsigned long long)uc->uc_mcontext.regs[30],
++			sig, (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)0 /* x86 has no link register */,
+ 			(unsigned long long)(uintptr_t)info->si_addr, (unsigned long long)base);
+ 	if (n > 0)
+ 		(void)!write(1, line, (size_t)n);
+@@ -334,26 +334,6 @@ Video& hostVideo()
+ 		sa.sa_sigaction = onSegv;
+ 		sa.sa_flags = SA_SIGINFO;
+ 		sigaction(SIGSEGV, &sa, &previousSegv);
+-		// Every interrupt on this device lands on core 0 (the SD card, Wi-Fi, the display, the GPU): the game's threads, all started from here on, keep to the other three.
+-		if (sysconf(_SC_NPROCESSORS_ONLN) >= 4)
+-		{
+-			cpu_set_t others;
+-			CPU_ZERO(&others);
+-			for (int core = 1; core < 4; core++)
+-				CPU_SET(core, &others);
+-			sched_setaffinity(0, sizeof(others), &others);
+-		}
+-		// This kernel prints all it logs to a serial port at 115200 baud, holding the console's lock, and a flip of the display (FBIOPAN_DISPLAY) takes that lock: a kilobyte of it (Wi-Fi
+-		// losing its access point and trying again, each try about that much) stops the frames for 90 ms. Off the port while a game runs; it's all in dmesg still.
+-		{
+-			int console = 0;
+-			if (FILE *f = fopen("/proc/sys/kernel/printk", "r"))
+-			{
+-				if (fscanf(f, "%d", &console) == 1 && console > 1 && klogctl(8, nullptr, 1) == 0)
+-					consoleLevelWas = console;
+-				fclose(f);
+-			}
+-		}
+ 		// DEADSTATION_RESOLUTION=1024: fb0 at the panel's own size; 640 or 320: that, at 4:3, the display engine scaling it up (the module's Resolution setting picks it)
+ 		const char *res = getenv("DEADSTATION_RESOLUTION");
+ 		std::string error;
+diff --git a/brick/host_link.cpp b/brick/host_link.cpp
+index a5c0dab..7cbee5f 100644
+--- a/brick/host_link.cpp
++++ b/brick/host_link.cpp
+@@ -41,6 +41,7 @@ constexpr const char *ControlPrefix = "control.";
+ 
+ // the Brick's inputs by their labels, as PSXRecomp's input.ini names them (SDL's names go by a button's place on the pad)
+ const std::map<std::string, std::string> Sources {
++	{ "LSLEFT", "leftx-" }, { "LSRIGHT", "leftx+" },
+ 	{ "A", "b" }, { "B", "a" }, { "X", "y" }, { "Y", "x" }, { "L1", "leftshoulder" }, { "R1", "rightshoulder" },
+ 	{ "L2", "lefttrigger" }, { "R2", "righttrigger" }, { "SELECT", "back" }, { "START", "start" }, { "FN1", "leftstick" },
+ 	{ "FN2", "rightstick" }, { "UP", "dpup" }, { "DOWN", "dpdown" }, { "LEFT", "dpleft" }, { "RIGHT", "dpright" },
+diff --git a/brick/panel.h b/brick/panel.h
+index ac76501..39342a9 100644
+--- a/brick/panel.h
++++ b/brick/panel.h
+@@ -16,6 +16,8 @@
+ #include <vector>
+ 
+ #include <linux/fb.h>
++#include <SDL.h>
++#include <SDL_vulkan.h>
+ 
+ class Panel
+ {
+@@ -25,7 +27,8 @@ public:
+ 	~Panel() { term(); }
+ 	// false, with the reason in error, without fb0 or its import
+ 	// native: fb0 at the panel's own size (1024 x 768), else 640 x 480 scaled by the display engine
+-	bool init(vk::Device device, bool native, std::string& error, uint32_t smallWidth = 640);
++	std::vector<const char*> instanceExtensions();
++	bool init(vk::Instance instance, vk::PhysicalDevice gpu, vk::Device device, uint32_t family, bool native, std::string& error, uint32_t smallWidth = 640);
+ 	void term();
+ 
+ 	vk::Extent2D extent() const { return { mode.xres, mode.yres }; }
+@@ -80,7 +83,18 @@ private:
+ 	void pan(uint32_t page);
+ 	void restoreMode();
+ 
+-	vk::Device device;
++    SDL_Window* window = nullptr;
++    vk::Instance instance;
++    vk::SurfaceKHR surface;
++    vk::Queue vkQueue;
++    vk::UniqueSwapchainKHR swapchain;
++    vk::Extent2D output;
++    std::vector<vk::Image> targets;
++    std::vector<vk::UniqueDeviceMemory> pageMemory;
++    vk::UniqueCommandPool copyPool;
++    std::vector<vk::UniqueCommandBuffer> copyCommands;
++    vk::UniqueSemaphore available, rendered;
++    vk::Device device;
+ 	int fd = -1;
+ 	// fb0 mapped uncached, as the display reads it: write() and read() go through a cached kernel
+ 	// mapping, which left parts of pictures stale on the screen
+diff --git a/brick/video.cpp b/brick/video.cpp
+index 9a757b3..83a1494 100644
+--- a/brick/video.cpp
++++ b/brick/video.cpp
+@@ -75,7 +75,8 @@ bool Video::init(bool native, bool smooth, std::string& error, uint32_t maxWidth
+ 		}
+ 		VULKAN_HPP_DEFAULT_DISPATCHER.init(getInstanceProcAddr);
+ 		vk::ApplicationInfo app("Deadstation", 1, "Deadstation", 1, VK_API_VERSION_1_1);
+-		instance = vk::createInstanceUnique(vk::InstanceCreateInfo(vk::InstanceCreateFlags(), &app));
++		auto instanceExt = screen.instanceExtensions();
++		instance = vk::createInstanceUnique(vk::InstanceCreateInfo(vk::InstanceCreateFlags(), &app, nullptr, instanceExt));
+ 		VULKAN_HPP_DEFAULT_DISPATCHER.init(*instance);
+ 		const auto devices = instance->enumeratePhysicalDevices();
+ 		if (devices.empty())
+@@ -98,12 +99,12 @@ bool Video::init(bool native, bool smooth, std::string& error, uint32_t maxWidth
+ 		}
+ 		const float priority = 1.f;
+ 		vk::DeviceQueueCreateInfo queueInfo(vk::DeviceQueueCreateFlags(), queueFamily, 1, &priority);
+-		const char *extensions[] = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME };
++		const char *extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+ 		device = physicalDevice.createDeviceUnique(vk::DeviceCreateInfo(vk::DeviceCreateFlags(), queueInfo, nullptr, extensions));
+ 		VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+ 		queue = device->getQueue(queueFamily, 0);
+ 
+-		if (!screen.init(*device, native, error, smallWidth))
++		if (!screen.init(*instance, physicalDevice, *device, queueFamily, native, error, smallWidth))
+ 			return false;
+ 		const vk::Extent2D extent = screen.extent();
+ 
+diff --git a/brick/video.h b/brick/video.h
+index 2a03b09..8722f7e 100644
+--- a/brick/video.h
++++ b/brick/video.h
+@@ -93,7 +93,7 @@ public:
+ 
+ 	// Submissions on a thread of their own (a recomp module's host; before init): the driver's work for a submission (its
+ 	// kernel calls) off the caller's thread. Every submission to the queue then goes through submit, in order.
+-	void setAsyncSubmit(bool on) { asyncSubmit = on; }
++	void setAsyncSubmit(bool on) { asyncSubmit = false; }
+ 	// cmds (ended) to the queue, fence signalled when done (reset by the caller); page >= 0: then shown (the panel)
+ 	void submit(const vk::CommandBuffer *cmds, uint32_t count, vk::Fence fence, int page = -1);
+ 	// every submission made (none waiting for the thread)
